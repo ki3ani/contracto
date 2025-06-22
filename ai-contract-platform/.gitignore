@@ -1,0 +1,79 @@
+# AWS SAM
+.aws-sam/
+samconfig.toml
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.so
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+logs/
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Node modules (for frontend)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Coverage
+coverage/
+.coverage
+.nyc_output
+
+# Temporary files
+*.tmp
+*.temp
+.DS_Store
+Thumbs.db
+
+# Package files
+*.zip
+*.tar.gz
+
+# CloudFormation
+packaged-template.yaml
+
+# AWS credentials
+.aws/
+
+# Local development
+events/
+.local/
+
+# Dependencies installed in function directories
+backend/src/functions/*/boto*
+backend/src/functions/*/botocore*
+backend/src/functions/*/urllib3*
+backend/src/functions/*/s3transfer*
+backend/src/functions/*/jmespath*
+backend/src/functions/*/dateutil*
+backend/src/functions/*/six*
+backend/src/functions/*/python_dateutil*

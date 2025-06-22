@@ -1,0 +1,104 @@
+{
+  "Comment": "Contract processing workflow",
+  "StartAt": "ExtractText",
+  "States": {
+    "ExtractText": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${TextExtractionFunctionArn}",
+        "Payload.$": "$"
+      },
+      "ResultSelector": {
+        "contract_id.$": "$.Payload.contract_id",
+        "extracted_text.$": "$.Payload.extracted_text",
+        "page_count.$": "$.Payload.page_count",
+        "extraction_confidence.$": "$.Payload.extraction_confidence"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleError",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "AnalyzeContract"
+    },
+    "AnalyzeContract": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${AIAnalysisFunctionArn}",
+        "Payload.$": "$"
+      },
+      "ResultSelector": {
+        "contract_id.$": "$.Payload.contract_id",
+        "analysis_results.$": "$.Payload.analysis_results",
+        "risk_score.$": "$.Payload.risk_score",
+        "key_terms.$": "$.Payload.key_terms",
+        "missing_clauses.$": "$.Payload.missing_clauses"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleError",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "SendNotification"
+    },
+    "SendNotification": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::events:putEvents",
+      "Parameters": {
+        "Entries": [
+          {
+            "Source": "contract.platform",
+            "DetailType": "Contract Processing Complete",
+            "Detail": {
+              "contract_id.$": "$.contract_id",
+              "status": "completed",
+              "timestamp.$": "$$.State.EnteredTime"
+            }
+          }
+        ]
+      },
+      "End": true
+    },
+    "HandleError": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::events:putEvents",
+      "Parameters": {
+        "Entries": [
+          {
+            "Source": "contract.platform",
+            "DetailType": "Contract Processing Failed",
+            "Detail": {
+              "contract_id.$": "$.contract_id",
+              "status": "failed",
+              "error.$": "$.error",
+              "timestamp.$": "$$.State.EnteredTime"
+            }
+          }
+        ]
+      },
+      "End": true
+    }
+  }
+}

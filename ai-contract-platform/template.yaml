@@ -1,0 +1,368 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: AI Contract Intelligence Platform
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  BucketName:
+    Type: String
+    Default: ai-contract-platform-documents
+  TableName:
+    Type: String
+    Default: contract-metadata
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Timeout: 300
+    MemorySize: 512
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        DOCUMENTS_BUCKET: !Ref DocumentsBucket
+        METADATA_TABLE: !Ref ContractMetadataTable
+        LOG_LEVEL: INFO
+
+Resources:
+  # S3 Bucket for contract storage
+  DocumentsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${BucketName}-${Environment}-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+
+  # DynamoDB table for contract metadata
+  ContractMetadataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${TableName}-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: contract_id
+          AttributeType: S
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: contract_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: user-id-created-at-index
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+  # Common Lambda layer
+  CommonLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub "contract-platform-common-${Environment}"
+      ContentUri: backend/src/layers/common
+      CompatibleRuntimes:
+        - python3.11
+      RetentionPolicy: Retain
+
+  # Lambda Functions
+  DocumentUploadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "contract-upload-${Environment}"
+      CodeUri: backend/src/functions/document_upload
+      Handler: handler.lambda_handler
+      Layers:
+        - !Ref CommonLayer
+      Policies:
+        - S3WritePolicy:
+            BucketName: !Ref DocumentsBucket
+        - DynamoDBWritePolicy:
+            TableName: !Ref ContractMetadataTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - states:StartExecution
+              Resource: !Ref ContractProcessingStateMachine
+      Events:
+        UploadApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ContractApi
+            Path: /upload
+            Method: post
+
+  TextExtractionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "contract-text-extraction-${Environment}"
+      CodeUri: backend/src/functions/text_extraction
+      Handler: handler.lambda_handler
+      Timeout: 900
+      MemorySize: 1024
+      Layers:
+        - !Ref CommonLayer
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref DocumentsBucket
+        - DynamoDBWritePolicy:
+            TableName: !Ref ContractMetadataTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - textract:DetectDocumentText
+                - textract:AnalyzeDocument
+                - textract:GetDocumentAnalysis
+              Resource: "*"
+
+  AIAnalysisFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "contract-ai-analysis-${Environment}"
+      CodeUri: backend/src/functions/ai_analysis
+      Handler: handler.lambda_handler
+      Timeout: 900
+      MemorySize: 2048
+      Layers:
+        - !Ref CommonLayer
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref ContractMetadataTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - comprehend:DetectSentiment
+                - comprehend:DetectEntities
+              Resource: "*"
+
+  ApiHandlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "contract-api-handler-${Environment}"
+      CodeUri: backend/src/functions/api_handler
+      Handler: handler.lambda_handler
+      Layers:
+        - !Ref CommonLayer
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref DocumentsBucket
+        - DynamoDBReadPolicy:
+            TableName: !Ref ContractMetadataTable
+      Events:
+        GetContract:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ContractApi
+            Path: /contracts/{contract_id}
+            Method: get
+        ListContracts:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ContractApi
+            Path: /contracts
+            Method: get
+        GetAnalysis:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ContractApi
+            Path: /contracts/{contract_id}/analysis
+            Method: get
+
+  # API Gateway
+  ContractApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "contract-platform-api-${Environment}"
+      StageName: !Ref Environment
+      Cors:
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+        AllowOrigin: "'*'"
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+
+  # Step Functions State Machine
+  ContractProcessingStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub "contract-processing-${Environment}"
+      DefinitionUri: backend/src/step_functions/contract_processing.json
+      DefinitionSubstitutions:
+        TextExtractionFunctionArn: !GetAtt TextExtractionFunction.Arn
+        AIAnalysisFunctionArn: !GetAtt AIAnalysisFunction.Arn
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref TextExtractionFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref AIAnalysisFunction
+        - Statement:
+            - Effect: Allow
+              Action:
+                - events:PutEvents
+              Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/default"
+
+  # EventBridge Custom Bus
+  ContractEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub "contract-platform-${Environment}"
+
+  # EventBridge Rule for processing completion
+  ProcessingCompleteRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventBusName: !Ref ContractEventBus
+      EventPattern:
+        source: ["contract.platform"]
+        detail-type: ["Contract Processing Complete"]
+      Targets:
+        - Arn: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/events/contract-processing"
+          Id: "LogTarget"
+
+  # Cognito User Pool
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "contract-platform-${Environment}"
+      AutoVerifiedAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: true
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub "contract-platform-client-${Environment}"
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ADMIN_NO_SRP_AUTH
+        - USER_PASSWORD_AUTH
+
+  # IAM Roles
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "ContractPlatformLambdaRole-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ContractPlatformPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: "*"
+
+  # CloudWatch Log Groups
+  DocumentUploadLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/contract-upload-${Environment}"
+      RetentionInDays: 14
+
+  TextExtractionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/contract-text-extraction-${Environment}"
+      RetentionInDays: 14
+
+  AIAnalysisLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/contract-ai-analysis-${Environment}"
+      RetentionInDays: 14
+
+  ApiHandlerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/contract-api-handler-${Environment}"
+      RetentionInDays: 14
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${ContractApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+    Export:
+      Name: !Sub "${AWS::StackName}-ApiEndpoint"
+
+  DocumentsBucketName:
+    Description: S3 bucket name for documents
+    Value: !Ref DocumentsBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-DocumentsBucket"
+
+  MetadataTableName:
+    Description: DynamoDB table name for metadata
+    Value: !Ref ContractMetadataTable
+    Export:
+      Name: !Sub "${AWS::StackName}-MetadataTable"
+
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub "${AWS::StackName}-UserPoolId"
+
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub "${AWS::StackName}-UserPoolClientId"
+
+  EventBusName:
+    Description: EventBridge Event Bus Name
+    Value: !Ref ContractEventBus
+    Export:
+      Name: !Sub "${AWS::StackName}-EventBus"
